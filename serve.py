@@ -1368,7 +1368,15 @@ async def solve(session: taskbridge.Session) -> str:
     task = session.instruction
     plan = await run_planner(session)
     await session.log(f"plan: {plan[:1000]}")
-    summary = await run_worker(session, plan)
+    
+    # Initialize worker agent with plan
+    worker = Agent(session, role="worker")
+    worker.messages = [
+        {"role": "system", "content": worker.get_system_prompt("")},
+        {"role": "user", "content": f"{task}\n\n## Plan\n{plan}"},
+    ]
+    summary = await worker.run()
+    
     for _ in range(MAX_FIX_ROUNDS):
         if not time_for(until(CHECK_SHARE / 2)):
             break
@@ -1378,15 +1386,8 @@ async def solve(session: taskbridge.Session) -> str:
             WRAP_UP_SEC
         ):
             break
-        # Add feedback to worker
-        agent = Agent(session, role="worker")
-        agent.messages = [
-            {"role": "system", "content": agent.get_system_prompt("")},
-            {"role": "user", "content": f"{task}\n\n## Plan\n{plan}"},
-        ]
-        # Replay the worker's conversation so far
-        # This is a simplified approach - in practice we'd need to track the full conversation
-        agent.messages.append({
+        # Add feedback to worker's existing conversation
+        worker.messages.append({
             "role": "user",
             "content": (
                 "A reviewer checked your files and found these"
@@ -1394,9 +1395,7 @@ async def solve(session: taskbridge.Session) -> str:
                 " summary."
             ),
         })
-        summary = (
-            await agent.run() or summary
-        )
+        summary = await worker.run() or summary
     return summary or session.final_message
 
 
