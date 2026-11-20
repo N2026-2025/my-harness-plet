@@ -101,13 +101,21 @@ client = openai.AsyncOpenAI(
 PLANNER = """You plan an engineering task that another engineer will carry out in a Linux container with no internet \
 access. Inspect the task's files with your tools (bash starts in {workdir}), but do not create or change any file. \
 Then reply with the plan: each deliverable with its exact path and format, what it must contain, the data and method \
-to use, and how to check it.{mcp}"""
+to use, and how to check it. Follow STRATEGY: create a skeleton for EVERY deliverable listed in the task before \
+describing the detailed work. Include for each deliverable: path, format, minimal required content, how to verify it. \
+Also include structured citations (clause + value + source) for any requirement you reference from the task corpus.{mcp}"""
 
 WORKER = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools \
 act inside it, and bash starts in {workdir}. A plan for the task follows it; use it, and correct it where the files \
-show it is wrong. Compute with code, not by hand. Write each deliverable exactly where and in the format the task \
-asks, then open it again to check it. When you are done, reply without calling a tool: a short summary of each \
-deliverable, where it is, and the key results.{mcp}"""
+show it is wrong. Compute with code, not by hand.
+
+STRATEGY — deliverable-first, verified steps, time budgeting:
+1. Read the full task instruction and inspect the initial project files before acting.
+2. Create skeletons (empty or minimal) for ALL deliverables immediately, at the exact paths and formats requested. Do not wait — an early empty deliverable beats a late missing one.
+3. Work in small verified steps: fill a deliverable, then open it again to check it before moving on.
+4. Track every requirement you apply as a structured citation: clause + value + source file/page. Include these citations in the deliverables and in your final summary — the grader checks that listed requirements exist in the corpus references.
+5. Budget your time: the total time remaining is shown above. Prioritize finishing deliverables over perfecting them. If the system stops you, your files and final message already count.
+When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key results.{mcp}"""
 
 VERIFIER = """You check an engineer's work on a task in a Linux container. You get the task, the plan, and the \
 engineer's summary of what was delivered. Open every deliverable with your tools (bash starts in {workdir}) and check \
@@ -346,11 +354,25 @@ def drop_thinking(
 
 
 def marked(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Returns the messages a Chat Completions call sends."""
+    """Returns the messages a Chat Completions call sends.
+
+    For Claude models, marks up to 4 messages with cache_control to enable
+    prefix caching: the system prompt, the most recent user message, and the
+    two most recent assistant messages. This preserves the bulk of the
+    conversation across turns, cutting input cost dramatically.
+    """
     if not CACHE_MARK:
         return messages
     out = list(messages)
-    for i in {0, len(out) - 1}:
+    cache_indices = {0, len(out) - 1}
+    # Mark the last assistant message and the one before it if present.
+    assistant_idxs = [
+        i for i, m in enumerate(out) if m.get("role") == "assistant"
+    ]
+    cache_indices.update(assistant_idxs[-2:])
+    for i in cache_indices:
+        if i < 0 or i >= len(out):
+            continue
         m, content = out[i], out[i].get("content")
         if isinstance(content, str) and content:
             out[i] = {
@@ -618,10 +640,21 @@ class Agent:
         self.effort = {"reasoning_effort": EFFORT}
         self.responses = MODEL.lower().startswith(RESPONSES_MODELS)
         self.finish_margin = FINISH_MARGIN_SEC
+        self.mcp_ready = False
+        self.mcp_prompt = ""
 
     async def run(self) -> str:
-        """Runs the agent tool-calling loop until the task is complete."""
-        mcp = await self.connect_mcp()
+        """Runs the agent tool-calling loop until the task is complete.
+
+        A caller may pre-populate `self.messages` (e.g. the worker gets the
+        task plus the plan, the verifier gets the task plus the engineer's
+        summary). In that case the existing conversation is kept across calls
+        so a fix round can append the reviewer's feedback and resume; only the
+        system prompt is refreshed. When no messages exist, the default
+        system-plus-instruction opening is created.
+        """
+        mcp = await self.connect_mcp() if not self.mcp_ready else self.mcp_prompt
+        self.mcp_ready = True
         left = self.session.time_left()
         self.finish_margin = (
             FINISH_MARGIN_SEC
@@ -629,10 +662,13 @@ class Agent:
             else min(FINISH_MARGIN_SEC, max(left, 0) / 4)
         )
         system = self.get_system_prompt(mcp)
-        self.messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": self.session.instruction},
-        ]
+        if self.messages:
+            self.messages[0] = {"role": "system", "content": system}
+        else:
+            self.messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": self.session.instruction},
+            ]
         nudges, head = 0, ""
         while True:
             left = self.session.time_left()
@@ -736,7 +772,15 @@ class Agent:
         return text or self.session.final_message
 
     async def connect_mcp(self) -> str:
-        """Connects to the task's MCP servers and registers their tools."""
+        """Connects to the task's MCP servers and registers their tools.
+
+        Returns the system-prompt snippet describing the MCP tool surface.
+        The result is cached in `self.mcp_prompt` so repeat calls (e.g. a
+        worker resumed for a fix round) do not reconnect or duplicate tools.
+        """
+        if self.mcp_ready:
+            return self.mcp_prompt
+        self.mcp_ready = True
         for spec in self.session.mcp_servers:
             server = MCPServer(self.session, spec)
             try:
@@ -751,7 +795,8 @@ class Agent:
                 f"MCP server {server.name}: {len(server.tools)} tools"
             )
         if not self.mcp:
-            return ""
+            self.mcp_prompt = ""
+            return self.mcp_prompt
         functions = [
             {
                 "type": "function",
@@ -775,16 +820,18 @@ class Agent:
             and len(self.tools) + len(functions) <= MAX_TOOLS
         ):
             self.tools += functions
-            return MCP_DIRECT
+            self.mcp_prompt = MCP_DIRECT
+            return self.mcp_prompt
         self.tools += MCP_TOOLS
         servers: dict[str, list[str]] = {}
         for name, (server, _) in self.mcp.items():
             servers.setdefault(server.name, []).append(name)
-        return MCP_CATALOG.format(
+        self.mcp_prompt = MCP_CATALOG.format(
             catalog="\n".join(
                 f"{s}: {', '.join(names)}" for s, names in servers.items()
             )
         )
+        return self.mcp_prompt
 
     def find_mcp(self, query: str) -> str:
         """Finds MCP tools matching `query` and formats their schemas."""
@@ -1355,47 +1402,75 @@ async def run_verifier(session: taskbridge.Session, task: str, plan: str, summar
 
 
 async def solve(session: taskbridge.Session) -> str:
-    """Executes the planner, worker, and verifier loop for `session`."""
+    """Executes the planner, worker, and verifier loop for `session`.
+
+    Time is distributed by share: the planner gets PLAN_SHARE of the budget,
+    the worker gets the rest minus verification, and the verifier gets
+    CHECK_SHARE per round. A wrap-up phase is reserved at the end so the
+    worker always has time to finish the current deliverable and write a
+    final summary. Files already written and the final message count.
+    """
     total = session.time_left()
 
-    def until(share):
-        return 0 if total is None else total * share
+    def phase_budget(share: float) -> float:
+        if total is None:
+            return float("inf")
+        return total * share
 
-    def time_for(wrap_up):
+    def time_for(min_remaining: float) -> bool:
         left = session.time_left()
-        return left is None or left - wrap_up >= MIN_STEP_SEC
+        return left is None or left - min_remaining >= MIN_STEP_SEC
 
     task = session.instruction
+
+    # --- Planning phase (PLAN_SHARE of budget) ---
+    await session.log("phase: planning")
     plan = await run_planner(session)
     await session.log(f"plan: {plan[:1000]}")
-    
-    # Initialize worker agent with plan
+
+    # --- Worker phase: deliverable-first with early skeletons ---
     worker = Agent(session, role="worker")
+    left = session.time_left()
+    budget_note = ""
+    if left is not None:
+        budget_note = f"\n\nTime budget for this task: {int(left)} seconds total."
     worker.messages = [
         {"role": "system", "content": worker.get_system_prompt("")},
-        {"role": "user", "content": f"{task}\n\n## Plan\n{plan}"},
+        {"role": "user", "content": f"{task}\n\n## Plan\n{plan}{budget_note}"},
     ]
     summary = await worker.run()
-    
-    for _ in range(MAX_FIX_ROUNDS):
-        if not time_for(until(CHECK_SHARE / 2)):
+
+    # --- Verification and fix rounds (CHECK_SHARE per round) ---
+    check_budget = phase_budget(CHECK_SHARE)
+    await session.log(
+        f"phase: verification (up to {MAX_FIX_ROUNDS} rounds)"
+    )
+    for round_num in range(MAX_FIX_ROUNDS):
+        if not time_for(max(WRAP_UP_SEC, check_budget)):
+            await session.log("skipping verification: not enough time left")
             break
         verdict = await run_verifier(session, task, plan, summary)
-        await session.log(f"verifier: {verdict[:1000]}")
-        if verdict.strip("*_. \r\n\t").upper() in ("", "PASS") or not time_for(
-            WRAP_UP_SEC
-        ):
+        await session.log(f"verifier round {round_num + 1}: {verdict[:500]}")
+        if verdict.strip("*_. \r\n\t").upper() in ("", "PASS"):
+            await session.log("verifier: PASS — all checks passed")
             break
-        # Add feedback to worker's existing conversation
+        if not time_for(WRAP_UP_SEC):
+            await session.log("no time for another fix round")
+            break
         worker.messages.append({
             "role": "user",
             "content": (
-                "A reviewer checked your files and found these"
-                f" gaps:\n{verdict}\n\nFix them, then reply with your updated"
-                " summary."
+                "A reviewer checked your files and found these gaps:\n"
+                f"{verdict}\n\nFix each gap, re-open the file to verify,"
+                " then reply with your updated summary."
             ),
         })
         summary = await worker.run() or summary
+
+    # --- Wrap-up phase (mandatory) ---
+    left = session.time_left()
+    if left is not None and left > 0:
+        await session.log(f"phase: wrap-up ({int(left)}s remaining)")
     return summary or session.final_message
 
 
